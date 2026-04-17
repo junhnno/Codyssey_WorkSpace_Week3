@@ -82,6 +82,69 @@ def mac(pattern, filter_):
 
 정규화 이유: 데이터 출처마다 표기 방식이 다를 수 있으므로, 비교 시점에 표현 차이로 인한 오판정을 방지하기 위함입니다.
 
+### 패턴 키 파싱 및 필터 매칭 설계
+
+`data.json`의 패턴 키는 `size_{N}_{idx}` 형태입니다 (예: `size_13_2`).
+프로그램은 이 키에서 필터 크기 N을 추출하고, 해당 크기의 필터를 자동으로 선택합니다.
+
+```python
+parts = key.split("_")        # "size_13_2" → ["size", "13", "2"]
+n = int(parts[1])              # N = 13 추출
+f_cross = filters[n]["Cross"]  # size_13 필터 선택
+```
+
+설계 의도는 다음과 같습니다.
+
+- 키 이름에 크기 정보가 포함되어 있으므로, 별도 메타데이터 없이 키만으로 어떤 필터를 써야 하는지 결정할 수 있습니다.
+- `filters` 딕셔너리를 `{정수 N: {"Cross": ..., "X": ...}}` 구조로 미리 구축해두면, 패턴 처리 시점에 `filters[n]`으로 O(1) 접근이 가능합니다.
+- 키 형식이 맞지 않거나 N 파싱에 실패하면 해당 케이스를 건너뛰고 경고 메시지를 출력합니다. 프로그램이 중단되지 않도록 방어 처리를 포함했습니다.
+
+### 시간 측정 경계 설계 (I/O 배제)
+
+성능 측정은 **MAC 연산 함수 호출 직전/직후**만을 경계로 삼아 I/O 시간을 완전히 배제했습니다.
+
+```python
+def measure_mac_time(pattern, filter_, repeat=10):
+    elapsed = []
+    for _ in range(repeat):
+        t0 = time.perf_counter()  # ← 측정 시작: 연산 직전
+        mac(pattern, filter_)      # MAC 연산만 수행
+        t1 = time.perf_counter()  # ← 측정 종료: 연산 직후
+        elapsed.append((t1 - t0) * 1000)
+    return sum(elapsed) / len(elapsed)
+```
+
+배제된 시간 범위는 다음과 같습니다.
+
+- `input()` 호출, `print()` 출력, `json.load()` 파일 읽기 등 I/O 작업
+- 필터/패턴 로드, 라벨 정규화, 결과 출력 등 전처리/후처리 구간
+
+`time.perf_counter()`는 운영체제가 제공하는 고해상도 타이머로, 마이크로초 단위 측정이 가능합니다.
+10회 반복 후 평균을 취하는 이유는 Python GC(가비지 컬렉터)나 OS 스케줄러로 인한 일회성 스파이크를 희석시키기 위함입니다.
+
+### MAC 점수가 높을수록 유사한 이유 (수리적 원리)
+
+MAC 연산의 수식은 다음과 같습니다.
+
+```
+score = Σ (pattern[i][j] × filter[i][j])   (i, j = 0 ~ N-1)
+```
+
+패턴과 필터의 값이 0 또는 1로만 구성된 경우를 기준으로 설명합니다.
+
+| 상황 | pattern | filter | 곱 | 의미 |
+|------|---------|--------|----|------|
+| 완전 일치 | 1 | 1 | **1** | 해당 위치에서 두 배열 모두 활성 → 유사도 기여 |
+| 패턴만 있음 | 1 | 0 | 0 | 필터가 해당 위치를 요구하지 않음 |
+| 필터만 있음 | 0 | 1 | 0 | 패턴에 해당 위치가 없음 |
+| 둘 다 없음 | 0 | 0 | 0 | 기여 없음 |
+
+즉, **두 배열이 같은 위치에서 동시에 1인 경우에만 점수에 기여**합니다.
+일치하는 위치가 많을수록 누적합(score)이 커지므로, MAC 점수가 높다는 것은 패턴과 필터의 형태가 그만큼 비슷하다는 의미입니다.
+
+완벽히 일치할 때 score = 필터 내 1의 개수(최대값), 전혀 일치하지 않으면 score = 0이 됩니다.
+이것이 내적(dot product) 기반 유사도 계산의 핵심 원리이며, AI의 합성곱 연산(Convolution)도 이 원리를 확장한 것입니다.
+
 ### 동점 처리 정책 (epsilon 기반)
 
 부동소수점 연산은 이론상 같은 값이어도 미세한 오차가 발생할 수 있습니다.
@@ -99,6 +162,21 @@ if abs(score_a - score_b) < EPSILON:
 두 점수의 차이가 `1e-9` 미만이면 동점(`UNDECIDED`)으로 처리합니다.
 이 값은 Python `float`(64비트 부동소수점)의 상대 정밀도(`~2.2e-16`)보다 훨씬 크므로,
 실제 값이 다른 경우를 동점으로 오인할 위험 없이 안전하게 오차를 흡수합니다.
+
+#### 모드 1 vs 모드 2의 동점 처리 차이
+
+두 모드는 동점 판정 로직 자체는 동일하지만, **동점 발생 시 결과 처리 방식**이 다릅니다.
+
+| 구분 | 모드 1 (사용자 입력) | 모드 2 (data.json) |
+|------|------------------|-----------------|
+| 동점 출력 | "판정 불가 (|A-B| < 1e-9)" | "UNDECIDED" |
+| PASS/FAIL 집계 | 없음 (단발성 실행) | FAIL로 집계 |
+| expected 비교 | 없음 | expected와 비교하여 FAIL 처리 |
+
+이렇게 다르게 설계한 이유는 **요구사항의 목적이 다르기 때문**입니다.
+
+- **모드 1**은 사용자가 직접 필터와 패턴을 입력하는 대화형 모드입니다. expected 정답이 없으므로 동점이면 단순히 "판단할 수 없음"을 알려주는 것으로 충분합니다.
+- **모드 2**는 `data.json`에 `expected` 정답이 명시된 자동 검증 모드입니다. 동점(UNDECIDED)은 확정적인 판정을 내리지 못한 것이므로, 정답과 일치 여부를 확인할 수 없어 FAIL로 처리하는 것이 올바른 평가 방식입니다.
 
 ---
 
@@ -331,334 +409,124 @@ $ python main.py
 (상세 원인 분석 및 복잡도 설명은 README.md의 '결과 리포트' 섹션에 작성)
 ```
 
-## 전체 코드
-``
-import json
-import time
+---
 
-# ─────────────────────────────────────────
-# 1. MAC 연산 (외부 라이브러리 금지 - 순수 반복문)
-# ─────────────────────────────────────────
+## 심층 분석
 
-def mac(pattern: list[list[float]], filter_: list[list[float]]) -> float:
-    """
-    MAC(Multiply-Accumulate) 연산
-    - pattern과 filter_의 같은 위치 원소끼리 곱한 뒤 전부 합산
-    - O(N²) : N×N 크기일 때 N² 번 곱셈 수행
-    """
-    n = len(pattern)
-    total = 0.0
-    for i in range(n):
-        for j in range(n):
-            total += pattern[i][j] * filter_[i][j]
-    return total
+### 새로운 라벨 확장 시 처리 순서
 
+예를 들어 `data.json`에 `'o'`(원형 패턴)라는 새 라벨이 추가된다면, 다음 순서로 확장합니다.
 
-# ─────────────────────────────────────────
-# 2. 라벨 정규화
-# ─────────────────────────────────────────
+**1단계 — 정규화 테이블 확장 (`LABEL_MAP`)**
 
+```python
 LABEL_MAP = {
     "+": "Cross",
     "cross": "Cross",
-    "Cross": "Cross",
     "x": "X",
-    "X": "X",
+    "o": "Circle",   # ← 추가
+    "circle": "Circle",  # ← 추가
 }
+```
 
-def normalize_label(raw: str) -> str | None:
-    """원시 라벨 → 표준 라벨(Cross / X). 인식 불가 시 None 반환."""
-    return LABEL_MAP.get(raw.strip(), None)
+**2단계 — 필터 로드 로직 확장 (`SIZE_KEYS`)**
 
+```python
+SIZE_KEYS = ["size_5", "size_13", "size_25"]
+# data.json에 Circle 필터가 추가됐다면 로드 시 자동으로 처리됨
+# filters[n]에 {"Cross": ..., "X": ..., "Circle": ...} 형태로 저장됨
+```
 
-# ─────────────────────────────────────────
-# 3. 점수 비교 (epsilon 기반)
-# ─────────────────────────────────────────
+**3단계 — 판정 로직 확장 (`judge` 함수)**
 
-EPSILON = 1e-9
+현재 `judge` 함수는 두 필터(A vs B) 비교만 지원합니다. 3개 이상의 필터를 비교하려면 다음과 같이 확장합니다.
 
-def judge(score_a: float, score_b: float, label_a: str = "A", label_b: str = "B") -> str:
-    """
-    두 점수를 비교해 판정 반환.
-    |score_a - score_b| < EPSILON → UNDECIDED(동점)
-    """
-    if abs(score_a - score_b) < EPSILON:
-        return "UNDECIDED"
-    return label_a if score_a > score_b else label_b
+```python
+def judge_multi(scores: dict[str, float]) -> str:
+    # {"Cross": 5.0, "X": 1.0, "Circle": 3.0}
+    best_label = max(scores, key=scores.get)
+    best_score = scores[best_label]
+    # 동점 검사: best_score와 동일한 점수가 2개 이상이면 UNDECIDED
+    tied = [l for l, s in scores.items() if abs(s - best_score) < EPSILON]
+    return "UNDECIDED" if len(tied) > 1 else best_label
+```
 
+**4단계 — 출력 및 PASS/FAIL 비교**
 
-# ─────────────────────────────────────────
-# 4. 성능 측정 유틸
-# ─────────────────────────────────────────
+판정 결과와 `expected`를 표준 라벨 기준으로 비교하는 로직은 변경 없이 재사용 가능합니다.
+정규화 함수(`normalize_label`)가 새 라벨을 처리할 수 있으면 이후 흐름은 자동으로 동작합니다.
 
-def measure_mac_time(pattern: list[list[float]], filter_: list[list[float]], repeat: int = 10) -> float:
-    """MAC 연산을 repeat 회 반복 측정 후 평균 시간(ms) 반환. I/O 시간 제외."""
-    elapsed = []
-    for _ in range(repeat):
-        t0 = time.perf_counter()
-        mac(pattern, filter_)
-        t1 = time.perf_counter()
-        elapsed.append((t1 - t0) * 1000)
-    return sum(elapsed) / len(elapsed)
+**확장 원칙 요약:** 라벨 정규화 테이블(LABEL_MAP)과 판정 함수만 수정하면, 나머지 로드/출력/집계 코드는 수정 없이 재사용됩니다. 이것이 정규화 로직을 별도 함수로 분리한 이유입니다.
 
+---
 
-# ─────────────────────────────────────────
-# 5. 입력 유틸 (모드 1)
-# ─────────────────────────────────────────
+### 1000×1000 패턴 처리 시 문제점과 최적화
 
-def input_matrix(name: str, n: int) -> list[list[float]]:
-    """n×n 행렬을 콘솔에서 한 줄씩 입력받는다. 오류 시 재입력 유도."""
-    print(f"\n{name} ({n}줄 입력, 공백 구분)")
-    matrix = []
-    while len(matrix) < n:
-        try:
-            row_str = input().strip()
-        except EOFError:
-            print("  입력 스트림이 종료되었습니다.")
-            break
-        try:
-            row = list(map(float, row_str.split()))
-        except ValueError:
-            print(f"  입력 형식 오류: 숫자를 공백으로 구분해 입력하세요. (행 {len(matrix)+1} 재입력)")
-            continue
-        if len(row) != n:
-            print(f"  입력 형식 오류: 각 줄에 {n}개의 숫자를 공백으로 구분해 입력하세요. (행 {len(matrix)+1} 재입력)")
-            continue
-        matrix.append(row)
-    return matrix
+**발생하는 문제**
 
+1000×1000 패턴의 MAC 연산은 **1,000,000번(10⁶)의 곱셈과 누적합**을 수행합니다.
+현재 구현(순수 Python 이중 반복문) 기준으로 추정 소요 시간을 계산하면 다음과 같습니다.
 
-# ─────────────────────────────────────────
-# 6. 성능 분석 출력
-# ─────────────────────────────────────────
+| 크기 | 연산 횟수(N²) | 예상 시간(ms) |
+|------|------------|------------|
+| 25×25 | 625 | ~0.03 ms |
+| 100×100 | 10,000 | ~0.5 ms |
+| 1000×1000 | 1,000,000 | **~50 ms** |
 
-def print_performance_table(cases: list[tuple[int, list[list[float]], list[list[float]]]]):
-    """cases: [(n, pattern, filter_), ...] 각 케이스 10회 반복 측정 후 표 출력"""
-    print("\n#---------------------------------------")
-    print("# [성능 분석] 평균/10회")
-    print("#---------------------------------------")
-    print(f"{'크기':<10} {'평균 시간(ms)':>15} {'연산 횟수(N²)':>15}")
-    print("-" * 42)
-    for n, pattern, filter_ in cases:
-        avg_ms = measure_mac_time(pattern, filter_, repeat=10)
-        ops = n * n
-        print(f"{n}×{n:<7} {avg_ms:>15.4f} {ops:>15}")
+단일 MAC 연산 기준으로 약 50ms이지만, 실제 AI 모델은 이런 연산을 수천 번 반복하므로 **총 수십 초 이상**이 소요될 수 있습니다.
 
+메모리 측면에서는 1000×1000 크기의 `float` 행렬 하나가 약 **8MB**(8 bytes × 10⁶)를 차지합니다. 패턴, 필터 여러 개를 동시에 메모리에 올리면 수십 MB에서 수백 MB가 필요해질 수 있습니다.
 
-# ─────────────────────────────────────────
-# 7. 모드 1 : 사용자 입력 (3×3)
-# ─────────────────────────────────────────
+**우선 적용할 최적화**
 
-def mode_user_input():
-    N = 3
-    print("\n#----------------------------------------")
-    print("# [1] 필터 입력")
-    print("#---------------------------------------")
-    filter_a = input_matrix("필터 A", N)
-    filter_b = input_matrix("필터 B", N)
+1. **1차원 배열로 변환 (메모리 접근 패턴 개선)**
+   - 2차원 리스트(`list[list[float]]`)는 각 행이 메모리 상 불연속적으로 배치됩니다.
+   - 1차원 배열(`list[float]`, 길이 N²)로 변환하면 연속된 메모리 접근으로 캐시 효율이 높아집니다.
+   ```python
+   # 2차원 → 1차원 변환
+   flat_pattern = [pattern[i][j] for i in range(n) for j in range(n)]
+   flat_filter  = [filter_[i][j] for i in range(n) for j in range(n)]
+   score = sum(flat_pattern[k] * flat_filter[k] for k in range(n * n))
+   ```
 
-    print("\n#---------------------------------------")
-    print("# [2] 패턴 입력")
-    print("#---------------------------------------")
-    pattern = input_matrix("패턴", N)
+2. **NumPy 허용 시 벡터화 연산**
+   - 외부 라이브러리 제약이 없다면 NumPy의 `np.dot()` 또는 `(a * b).sum()`을 사용합니다.
+   - NumPy는 내부적으로 C로 구현된 BLAS 루틴을 호출하므로, 순수 Python 대비 **100배 이상** 빠릅니다.
 
-    print("\n#---------------------------------------")
-    print("# [3] MAC 결과")
-    print("#---------------------------------------")
-    score_a = mac(pattern, filter_a)
-    score_b = mac(pattern, filter_b)
+3. **청크(chunk) 단위 처리 (메모리 절약)**
+   - 전체 행렬을 한 번에 메모리에 올리지 않고, 행 단위로 분할해 처리하면 메모리 사용량을 줄일 수 있습니다.
 
-    avg_ms = measure_mac_time(pattern, filter_a, repeat=10)
-    verdict = judge(score_a, score_b, label_a="A", label_b="B")
+---
 
-    print(f"A 점수: {score_a}")
-    print(f"B 점수: {score_b}")
-    print(f"연산 시간(평균/10회): {avg_ms:.4f} ms")
-    if verdict == "UNDECIDED":
-        print(f"판정: 판정 불가 (|A-B| < {EPSILON})")
-    else:
-        print(f"판정: {verdict}")
+### CPU 직렬 처리 vs NPU 병렬 처리 — 병목 위치 분석
 
-    print_performance_table([(N, pattern, filter_a)])
+**CPU 직렬 처리의 병목**
 
+현재 구현은 CPU에서 이중 for문으로 N² 번의 곱셈을 **순서대로 하나씩** 실행합니다.
 
-# ─────────────────────────────────────────
-# 8. 모드 2 : data.json 분석
-# ─────────────────────────────────────────
+```
+연산 1 → 연산 2 → 연산 3 → ... → 연산 N²
+(한 번에 1개씩, 직렬)
+```
 
-def load_json(path: str = "data.json") -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+병목은 두 곳에서 발생합니다.
 
+- **연산 병목:** Python 인터프리터는 바이트코드를 한 줄씩 해석하며 실행하므로 루프 오버헤드가 큽니다. N²번의 반복은 곱셈 자체보다 루프 관리 비용이 더 클 수 있습니다.
+- **메모리 병목:** 2차원 리스트의 각 행은 메모리 상에서 불연속적으로 흩어져 있습니다. `pattern[i][j]` 접근마다 포인터를 두 번 역참조하므로 캐시 미스가 자주 발생합니다.
 
-def mode_json_analysis():
-    print("\n#---------------------------------------")
-    print("# [1] 필터 로드")
-    print("#---------------------------------------")
-    try:
-        data = load_json("data.json")
-    except FileNotFoundError:
-        print("  오류: data.json 파일을 찾을 수 없습니다.")
-        return
-    except json.JSONDecodeError as e:
-        print(f"  오류: data.json 파싱 실패 - {e}")
-        return
+**NPU 병렬 처리가 이를 해결하는 방식**
 
-    raw_filters = data.get("filters", {})
-    filters = {}
-    SIZE_KEYS = ["size_5", "size_13", "size_25"]
+NPU(Neural Processing Unit)는 수천 개의 MAC 연산 유닛을 가지고 있어, N² 번의 곱셈을 **동시에(병렬로)** 처리할 수 있습니다.
 
-    for sk in SIZE_KEYS:
-        n = int(sk.split("_")[1])
-        if sk not in raw_filters:
-            print(f"  경고: {sk} 필터 없음 - 해당 크기 케이스는 FAIL 처리")
-            continue
-        raw_f = raw_filters[sk]
-        normalized = {}
-        for label_key, matrix in raw_f.items():
-            std = normalize_label(label_key)
-            if std is None:
-                print(f"  경고: {sk} 필터의 라벨 '{label_key}' 인식 불가 - 무시")
-                continue
-            normalized[std] = matrix
-        if "Cross" not in normalized or "X" not in normalized:
-            print(f"  경고: {sk} 필터에 Cross/X 중 하나 이상 누락")
-            continue
-        filters[n] = normalized
-        print(f"  ✓ {sk}  필터 로드 완료 (Cross, X)")
+```
+연산 1  연산 2  연산 3  ...  연산 N²
+  ↓       ↓       ↓             ↓
+(동시에 처리, 병렬)
+→ 이론적으로 O(N²) → O(1)에 가까운 처리 시간
+```
 
-    print("\n#---------------------------------------")
-    print("# [2] 패턴 분석 (라벨 정규화 적용)")
-    print("#---------------------------------------")
+즉, 크기가 커질수록 CPU는 시간이 N²에 비례해 증가하지만, NPU는 병렬 처리 유닛 수만큼 속도를 유지합니다. 이것이 AI 추론에 NPU가 필수인 이유입니다.
 
-    raw_patterns = data.get("patterns", {})
-    total = 0
-    passed = 0
-    failed_cases = []
-    perf_cases: dict[int, tuple] = {}
-
-    for key, val in raw_patterns.items():
-        parts = key.split("_")
-        if len(parts) < 3 or parts[0] != "size":
-            print(f"  경고: 키 '{key}' 형식 불인식 - 건너뜀")
-            continue
-        try:
-            n = int(parts[1])
-        except ValueError:
-            print(f"  경고: 키 '{key}'에서 크기 파싱 실패 - 건너뜀")
-            continue
-
-        total += 1
-        print(f"\n--- {key} ---")
-
-        if n not in filters:
-            reason = f"size_{n} 필터 없음"
-            print(f"  FAIL ({reason})")
-            failed_cases.append((key, reason))
-            continue
-
-        f_cross = filters[n]["Cross"]
-        f_x = filters[n]["X"]
-        pattern_data = val.get("input", None)
-        expected_raw = val.get("expected", None)
-
-        if pattern_data is None:
-            reason = "'input' 키 없음"
-            print(f"  FAIL ({reason})")
-            failed_cases.append((key, reason))
-            continue
-        if expected_raw is None:
-            reason = "'expected' 키 없음"
-            print(f"  FAIL ({reason})")
-            failed_cases.append((key, reason))
-            continue
-
-        if len(pattern_data) != n or any(len(row) != n for row in pattern_data):
-            reason = f"패턴 크기 불일치 (expected {n}×{n})"
-            print(f"  FAIL ({reason})")
-            failed_cases.append((key, reason))
-            continue
-        if len(f_cross) != n or any(len(row) != n for row in f_cross):
-            reason = "Cross 필터 크기 불일치"
-            print(f"  FAIL ({reason})")
-            failed_cases.append((key, reason))
-            continue
-
-        expected = normalize_label(str(expected_raw))
-        if expected is None:
-            reason = f"expected 라벨 '{expected_raw}' 인식 불가"
-            print(f"  FAIL ({reason})")
-            failed_cases.append((key, reason))
-            continue
-
-        score_cross = mac(pattern_data, f_cross)
-        score_x = mac(pattern_data, f_x)
-        verdict = judge(score_cross, score_x, label_a="Cross", label_b="X")
-
-        print(f"  Cross 점수: {score_cross}")
-        print(f"  X     점수: {score_x}")
-
-        if verdict == expected:
-            passed += 1
-            print(f"  판정: {verdict} | expected: {expected} | PASS")
-        elif verdict == "UNDECIDED":
-            reason = f"동점(UNDECIDED) - expected: {expected}"
-            print(f"  판정: {verdict} | expected: {expected} | FAIL (동점 규칙)")
-            failed_cases.append((key, reason))
-        else:
-            reason = f"판정 {verdict} ≠ expected {expected}"
-            print(f"  판정: {verdict} | expected: {expected} | FAIL")
-            failed_cases.append((key, reason))
-
-        if n not in perf_cases:
-            perf_cases[n] = (pattern_data, f_cross)
-
-    cross_3 = [[0,1,0],[1,1,1],[0,1,0]]
-    if 3 not in perf_cases:
-        perf_cases[3] = (cross_3, cross_3)
-
-    perf_list = [(n, pat, fil) for n, (pat, fil) in sorted(perf_cases.items())]
-    print_performance_table(perf_list)
-
-    print("\n#---------------------------------------")
-    print("# [4] 결과 요약")
-    print("#---------------------------------------")
-    fail_count = len(failed_cases)
-    print(f"총 테스트: {total}개")
-    print(f"통과:      {passed}개")
-    print(f"실패:      {fail_count}개")
-    if failed_cases:
-        print("\n실패 케이스:")
-        for case_key, reason in failed_cases:
-            print(f"  - {case_key}: {reason}")
-    print("\n(상세 원인 분석 및 복잡도 설명은 README.md의 '결과 리포트' 섹션에 작성)")
-
-
-# ─────────────────────────────────────────
-# 9. 메인
-# ─────────────────────────────────────────
-
-def main():
-    print("=== Mini NPU Simulator ===")
-    print("\n[모드 선택]")
-    print("1. 사용자 입력 (3x3)")
-    print("2. data.json 분석")
-
-    while True:
-        choice = input("선택: ").strip()
-        if choice == "1":
-            mode_user_input()
-            break
-        elif choice == "2":
-            mode_json_analysis()
-            break
-        else:
-            print("  1 또는 2를 입력하세요.")
-
-
-if __name__ == "__main__":
-    main()
-``
 ---
 
 ## 파일 구조
